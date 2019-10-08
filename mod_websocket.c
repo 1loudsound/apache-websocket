@@ -54,6 +54,7 @@ typedef struct
     apr_dso_handle_t *res_handle;
     WebSocketPlugin *plugin;
     apr_int64_t payload_limit;
+    apr_uri_t proxy_url;
 } websocket_config_rec;
 
 #define BLOCK_DATA_SIZE              4096
@@ -111,6 +112,10 @@ static void *mod_websocket_create_dir_config(apr_pool_t *p, char *path)
         if (conf != NULL) {
             conf->location = apr_pstrdup(p, path);
             conf->payload_limit = 32 * 1024 * 1024;
+            conf->proxy_url.scheme = NULL;
+            conf->proxy_url.hostname = NULL;
+            conf->proxy_url.port = 0;
+            conf->proxy_url.is_initialized = 0;
         }
     }
     return (void *)conf;
@@ -176,6 +181,27 @@ static const char *mod_websocket_conf_handler(cmd_parms *cmd, void *confv,
         else {
             response = "Could not open WebSocket handler module";
         }
+    }
+    else {
+        response = "Invalid parameters";
+    }
+    return response;
+}
+
+static const char *mod_websocket_conf_proxy(cmd_parms *cmd, void *confv,
+                                            const char *proxy_url)
+{
+    websocket_config_rec *conf = (websocket_config_rec *)confv;
+    char *response;
+
+    if ((conf != NULL) && (proxy_url != NULL) &&
+        (apr_uri_parse(cmd->pool, proxy_url, &conf->proxy_url) == APR_SUCCESS) &&
+        (strcmp(conf->proxy_url.scheme, "ws") == 0)) { /* Only support "ws" for now */
+        if ((conf->proxy_url.path == NULL) ||
+            (conf->proxy_url.path[0] == '\0')) {
+            conf->proxy_url.path = apr_pstrdup(cmd->pool, "/");
+        }
+        response = NULL;
     }
     else {
         response = "Invalid parameters";
@@ -463,18 +489,136 @@ typedef struct _WebSocketFrameData
 } WebSocketFrameData;
 
 /*
- * The data framing handler requires that the server state mutex is locked by
- * the caller upon entering this function. It will be locked when leaving too.
+ * Forward data from the incoming socket to the outgoing socket
  */
-static void mod_websocket_data_framing(const WebSocketServer *server,
-                                       websocket_config_rec *conf,
-                                       void *plugin_private)
+static apr_status_t mod_websocket_proxy_forward(apr_socket_t *in_sock,
+                                                apr_socket_t *out_sock)
 {
-    WebSocketState *state = server->state;
-    request_rec *r = state->r;
-    apr_pool_t *pool = NULL;
-    apr_bucket_alloc_t *bucket_alloc;
-    apr_bucket_brigade *obb;
+    char buffer[BLOCK_DATA_SIZE];
+    apr_size_t nbytes = sizeof(buffer);
+
+    if (apr_socket_recv(in_sock, buffer, &nbytes) == APR_SUCCESS) {
+        apr_size_t remaining = nbytes;
+        char *ptr = buffer;
+
+        while ((remaining > 0) &&
+               (apr_socket_send(out_sock, ptr, &nbytes) == APR_SUCCESS)) {
+            ptr += nbytes;
+            remaining -= nbytes;
+            nbytes = remaining;
+        }
+        if (remaining == 0) {
+            return APR_SUCCESS;
+        }
+    }
+    return APR_EGENERAL;
+}
+
+/*
+ * The main loop used by the proxy path to forward data from one socket to the
+ * other.
+ */
+static void mod_websocket_proxy_loop(request_rec *r,
+                                     apr_socket_t *client_sock,
+                                     apr_socket_t *server_sock)
+{
+    apr_pollset_t *poll_set;
+
+    if (apr_pollset_create(&poll_set, 2, r->pool, 0) == APR_SUCCESS) {
+        const apr_pollfd_t *descriptors;
+        apr_socket_t *in_sock, *out_sock;
+        apr_int32_t num_descriptors, i;
+        apr_pollfd_t poll_fd;
+
+        /* Client socket */
+        poll_fd.p = r->pool;
+        poll_fd.desc_type = APR_POLL_SOCKET;
+        poll_fd.reqevents = APR_POLLIN;
+        poll_fd.desc.s = client_sock;
+        poll_fd.client_data = NULL;
+        apr_pollset_add(poll_set, &poll_fd);
+        /* Server socket */
+        poll_fd.desc.s = server_sock;
+        apr_pollset_add(poll_set, &poll_fd);
+
+        while (apr_pollset_poll(poll_set, -1,
+                                &num_descriptors, &descriptors) == APR_SUCCESS) {
+            for (i = 0; i < num_descriptors; i++) {
+                if (descriptors[i].desc.s == client_sock) {
+                  in_sock = client_sock;
+                  out_sock = server_sock;
+                }
+                else {
+                  in_sock = server_sock;
+                  out_sock = client_sock;
+                }
+                if ((descriptors[i].rtnevents & APR_POLLERR) ||
+                    (descriptors[i].rtnevents & APR_POLLHUP) ||
+                   !(descriptors[i].rtnevents & APR_POLLIN) ||
+                    (mod_websocket_proxy_forward(in_sock,
+                                                 out_sock) != APR_SUCCESS)) {
+                    break;
+                }
+            }
+            if (i != num_descriptors) {
+               break;
+            }
+        }
+    }
+}
+
+static void mod_websocket_proxy_handler(websocket_config_rec *conf,
+                                        request_rec *r)
+{
+    apr_socket_t *client_sock = ap_get_module_config(r->connection->conn_config,
+                                                     &core_module);
+    apr_socket_t *server_sock = NULL;
+    apr_sockaddr_t *sa = NULL;
+
+    const char *hostname = conf->proxy_url.hostname;
+    const char *path = conf->proxy_url.path;
+    const apr_port_t port = conf->proxy_url.port;
+
+    if ((apr_socket_create(&server_sock, AF_INET, SOCK_STREAM, 0,
+                           r->pool) == APR_SUCCESS) &&
+        (apr_sockaddr_info_get(&sa, hostname, APR_UNSPEC, port,
+                               0, r->pool) == APR_SUCCESS) &&
+        (apr_socket_connect(server_sock, sa) == APR_SUCCESS)) {
+        char buffer[BLOCK_DATA_SIZE];
+        const apr_array_header_t *arr = apr_table_elts(r->headers_in);
+        const apr_table_entry_t *header = (const apr_table_entry_t *)arr->elts;
+        apr_size_t size = strlen(r->method) + strlen(path) + strlen(r->protocol) + 7;
+        int j;
+
+        for (j = 0; j < arr->nelts; j++) {
+          size += strlen(header[j].key) + strlen(header[j].val) + 4;
+        }
+        if (size <= BLOCK_DATA_SIZE) {
+            apr_size_t offset = sprintf(buffer, "%s %s %s\r\n",
+                                        r->method, path, r->protocol);
+
+            if (header != NULL) {
+                for (j = 0; j < arr->nelts; j++) {
+                    offset += sprintf(buffer + offset,"%s: %s\r\n",
+                                      header[j].key, header[j].val);
+                }
+            }
+            offset += sprintf(buffer + offset,"\r\n");
+
+            if (apr_socket_send(server_sock, buffer, &offset) == APR_SUCCESS) {
+                mod_websocket_proxy_loop(r, client_sock, server_sock);
+            }
+        }
+    }
+    if (server_sock != NULL) {
+        apr_socket_close(server_sock);
+    }
+}
+
+static apr_bucket_brigade* mod_websocket_get_bucket_brigade(apr_pool_t *ppool)
+{
+    apr_allocator_t *allocator = NULL;
+    apr_bucket_brigade* bb = NULL;
 
     /* We cannot use the same bucket allocator for the ouput bucket brigade
      * obb as the one associated with the connection (r->connection->bucket_alloc)
@@ -485,9 +629,38 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
      * for output thread bucket brigade. (Thanks to Alex Bligh -- abligh)
      */
 
-    if ((apr_pool_create(&pool, r->pool) == APR_SUCCESS) &&
-        ((bucket_alloc = apr_bucket_alloc_create(pool)) != NULL) &&
-        ((obb = apr_brigade_create(pool, bucket_alloc)) != NULL)) {
+    if (apr_allocator_create(&allocator) == APR_SUCCESS) {
+        apr_pool_t *pool = NULL;
+
+        apr_allocator_max_free_set(allocator, 1024*1024);
+        if (apr_pool_create_ex(&pool, ppool, NULL, allocator) == APR_SUCCESS) {
+            apr_bucket_alloc_t *bucket_alloc;
+
+            apr_allocator_owner_set(allocator, pool);
+            if ((bucket_alloc = apr_bucket_alloc_create(pool)) != NULL) {
+                bb = apr_brigade_create(pool, bucket_alloc);
+            }
+        }
+        else {
+            apr_allocator_destroy(allocator);
+        }
+    }
+    return bb;
+}
+
+/*
+ * The data framing handler requires that the server state mutex is locked by
+ * the caller upon entering this function. It will be locked when leaving too.
+ */
+static void mod_websocket_data_framing(const WebSocketServer *server,
+                                       websocket_config_rec *conf,
+                                       void *plugin_private)
+{
+    WebSocketState *state = server->state;
+    request_rec *r = state->r;
+    apr_bucket_brigade *obb = mod_websocket_get_bucket_brigade(r->pool);
+
+    if (obb != NULL) {
         unsigned char block[BLOCK_DATA_SIZE];
         apr_int64_t block_size;
         apr_int64_t extension_bytes_remaining = 0;
@@ -944,7 +1117,7 @@ static int mod_websocket_method_handler(request_rec *r)
                     }
 
                     apr_thread_mutex_create(&state.mutex,
-                                            APR_THREAD_MUTEX_DEFAULT,
+                                            APR_THREAD_MUTEX_UNNESTED,
                                             r->pool);
                     apr_thread_mutex_lock(state.mutex);
 
@@ -1003,6 +1176,17 @@ static int mod_websocket_method_handler(request_rec *r)
 
                     return OK;
                 }
+                else if ((conf != NULL) &&
+                         (conf->proxy_url.hostname != NULL) &&
+                         (conf->proxy_url.path != NULL) &&
+                         (conf->proxy_url.port != 0)) {
+                    mod_websocket_proxy_handler(conf, r);
+
+                    r->connection->keepalive = AP_CONN_CLOSE;
+                    ap_lingering_close(r->connection);
+
+                    return OK;
+                }
             }
         }
     }
@@ -1013,6 +1197,9 @@ static const command_rec websocket_cmds[] = {
     AP_INIT_TAKE2("WebSocketHandler", mod_websocket_conf_handler, NULL,
                   OR_AUTHCFG,
                   "Shared library containing WebSocket implementation followed by function initialization function name"),
+    AP_INIT_TAKE1("WebSocketProxy", mod_websocket_conf_proxy, NULL,
+                  OR_AUTHCFG,
+                  "Proxy WebSocket requests to another server and/or port"),
     AP_INIT_TAKE1("MaxMessageSize", mod_websocket_conf_max_message_size, NULL,
                   OR_AUTHCFG,
                   "Maximum size (in bytes) of a message to accept; default is 33554432 bytes (32 MB)"),
